@@ -1,0 +1,22 @@
+# Python Virtual Environment
+.venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# IDE/Editor specific files
+.idea/
+.vscode/
+
+# Build artifacts from PyInstaller
+build/
+dist/
+*.spec
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Configuration files
+config.json
