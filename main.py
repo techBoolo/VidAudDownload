@@ -1,27 +1,27 @@
 import sys
 import os
+import configparser # New import
 import yt_dlp
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout,
     QLineEdit, QRadioButton, QComboBox, QPushButton,
-    QCheckBox, QProgressBar, QLabel
+    QCheckBox, QProgressBar, QLabel, QFileDialog # New import
 )
 from PySide6.QtCore import Qt, QObject, Signal, QThread, QMetaObject
 
 class Worker(QObject):
+    # (Worker class is identical to previous step)
     info_ready = Signal(dict)
     progress = Signal(int)
     finished = Signal(dict)
     error = Signal(str)
 
-    # 1. Add instance attribute for cancellation flag.
     def __init__(self):
         super().__init__()
         self._is_cancelled = False
 
     def validate_url(self, url):
-        # (Identical to previous step)
         try:
             ydl_opts = {'extract_flat': True, 'force_generic_extractor': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -33,47 +33,28 @@ class Worker(QObject):
             self.error.emit(f"An error occurred: {str(e)}")
 
     def start_download(self, download_info):
-        # 4. Reset cancellation flag at the start of a new download.
         self._is_cancelled = False
-
         def progress_hook(d):
-            # 3. Check for cancellation flag in the progress hook.
-            if self._is_cancelled:
-                raise Exception('Download Cancelled')
-                
+            if self._is_cancelled: raise Exception('Download Cancelled')
             if d['status'] == 'downloading':
                 if '%' in d['_percent_str']:
                     percent = int(float(d['_percent_str'].strip().replace('%', '')))
                     self.progress.emit(percent)
             elif d['status'] == 'finished':
-                # Check one last time before finishing, in case cancel was clicked during post-processing.
-                if self._is_cancelled:
-                    raise Exception('Download Cancelled')
-                self.finished.emit({
-                    'status': 'finished',
-                    'filename': d.get('filename')
-                })
-
+                if self._is_cancelled: raise Exception('Download Cancelled')
+                self.finished.emit({'status': 'finished', 'filename': d.get('filename')})
         ydl_opts = {
-            'format': download_info['format_id'],
-            'outtmpl': download_info['save_path'],
+            'format': download_info['format_id'], 'outtmpl': download_info['save_path'],
             'progress_hooks': [progress_hook],
         }
-
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([download_info['url']])
         except Exception as e:
-            # 4. Handle the cancellation exception cleanly.
-            if str(e) == 'Download Cancelled':
-                # Don't emit an error, just stop silently. The UI will handle the state.
-                print("Download successfully cancelled by user.")
-            else:
-                self.error.emit(f"Download Failed: {str(e)}")
+            if str(e) == 'Download Cancelled': print("Download successfully cancelled by user.")
+            else: self.error.emit(f"Download Failed: {str(e)}")
     
-    # 2. Create a public method to set the cancellation flag.
     def cancel_download(self):
-        """Sets the flag to signal cancellation."""
         self._is_cancelled = True
 
 
@@ -83,8 +64,10 @@ class VidAudDownload(QMainWindow):
         self.setWindowTitle("VidAudDownload")
         self.resize(800, 600)
         self.final_file_path = None
+        # 2. Define path for settings file
+        self.settings_file = 'config.ini'
 
-        # --- UI Setup (Identical to previous step) ---
+        # --- UI Setup ---
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
@@ -103,8 +86,8 @@ class VidAudDownload(QMainWindow):
         self.save_as_input = QLineEdit()
         main_layout.addWidget(self.save_as_input)
         destination_layout = QHBoxLayout()
-        self.destination_folder = os.path.expanduser("~/Downloads")
-        self.destination_path_label = QLabel(f"Destination: {self.destination_folder}")
+        # The label will be set by load_settings()
+        self.destination_path_label = QLabel()
         self.browse_button = QPushButton("Browse...")
         destination_layout.addWidget(self.destination_path_label)
         destination_layout.addWidget(self.browse_button)
@@ -138,17 +121,59 @@ class VidAudDownload(QMainWindow):
         self.worker.moveToThread(self.thread)
         self.thread.start()
 
-        # 5. Connect the Cancel button's clicked signal.
+        # Connections
         self.url_input.textChanged.connect(self.on_url_changed)
         self.video_radio.toggled.connect(self.on_url_changed)
         self.download_button.clicked.connect(self.on_download_clicked)
-        self.cancel_button.clicked.connect(self.on_cancel_clicked) # New connection
+        self.cancel_button.clicked.connect(self.on_cancel_clicked)
+        # 3. Connect the "Browse..." button
+        self.browse_button.clicked.connect(self.open_folder_dialog)
         self.worker.info_ready.connect(self.on_info_ready)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.on_download_finished)
         self.worker.error.connect(self.on_error)
+        
+        # 2. Call load_settings on startup.
+        self.load_settings()
 
-    # ... (on_url_changed, on_info_ready, on_download_clicked, update_progress methods are identical to Step 7) ...
+    # 2. New methods for settings persistence
+    def load_settings(self):
+        """Loads destination folder from config.ini, defaulting to Downloads."""
+        config = configparser.ConfigParser()
+        if os.path.exists(self.settings_file):
+            config.read(self.settings_file)
+            # Use fallback for safety
+            self.destination_folder = config.get('Settings', 'destination_folder', fallback=os.path.expanduser("~"))
+        else:
+            self.destination_folder = os.path.expanduser("~/Downloads")
+        
+        self.destination_path_label.setText(f"Destination: {self.destination_folder}")
+
+    def save_settings(self):
+        """Saves the current destination folder to config.ini."""
+        config = configparser.ConfigParser()
+        config['Settings'] = {'destination_folder': self.destination_folder}
+        with open(self.settings_file, 'w') as configfile:
+            config.write(configfile)
+
+    # 4. New slot for the "Browse..." button
+    def open_folder_dialog(self):
+        """Opens a dialog for the user to select a folder."""
+        folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.destination_folder)
+        if folder: # If the user selected a folder and didn't cancel
+            self.destination_folder = folder
+            self.destination_path_label.setText(f"Destination: {self.destination_folder}")
+            self.save_settings()
+
+    def on_download_clicked(self):
+        # This method is now updated to use the saved destination_folder
+        sanitized_filename = "".join([c for c in self.save_as_input.text() if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).rstrip()
+        save_path = os.path.join(self.destination_folder, sanitized_filename + ".%(ext)s")
+        download_info = {'url': self.url_input.text(), 'format_id': self.quality_dropdown.currentData(), 'save_path': save_path}
+        self.prepare_ui_for_download()
+        QMetaObject.invokeMethod(self.worker, "start_download", Qt.ConnectionType.QueuedConnection, Q_ARG(dict, download_info))
+
+    # --- Other methods are identical to Step 8 ---
     def on_url_changed(self, url=""):
         if not self.url_input.text(): return
         self.reset_ui_for_new_url()
@@ -176,39 +201,22 @@ class VidAudDownload(QMainWindow):
             self.status_label.setText("Ready to download")
         else: self.status_label.setText("No compatible formats found.")
         self.save_as_input.setEnabled(True)
-    def on_download_clicked(self):
-        sanitized_filename = "".join([c for c in self.save_as_input.text() if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).rstrip()
-        save_path = os.path.join(self.destination_folder, sanitized_filename + ".%(ext)s")
-        download_info = {'url': self.url_input.text(), 'format_id': self.quality_dropdown.currentData(), 'save_path': save_path}
-        self.prepare_ui_for_download()
-        QMetaObject.invokeMethod(self.worker, "start_download", Qt.ConnectionType.QueuedConnection, Q_ARG(dict, download_info))
     def update_progress(self, percent):
         self.progress_bar.setValue(percent)
-        
     def on_cancel_clicked(self):
-        """
-        Calls the worker's cancel method and updates the UI.
-        """
         self.status_label.setText("Cancelling...")
         self.worker.cancel_download()
-        # The UI will be fully reset by the on_error or on_download_finished signal,
-        # or in this case, by the download stopping and no signal being sent.
-        # We can add a more immediate reset here.
         self.reset_ui_after_download()
         self.status_label.setText("Download Cancelled")
-
     def on_download_finished(self, result_dict):
         self.progress_bar.setValue(100)
         self.status_label.setText("Download Complete")
         self.final_file_path = result_dict.get('filename')
         self.show_in_folder_button.setVisible(True)
         self.reset_ui_after_download()
-
     def on_error(self, error_message):
         self.status_label.setText(error_message)
         self.reset_ui_after_download()
-        
-    # ... (UI State Management Methods are identical to Step 7) ...
     def prepare_ui_for_download(self):
         self.url_input.setEnabled(False)
         self.quality_dropdown.setEnabled(False)
@@ -235,7 +243,6 @@ class VidAudDownload(QMainWindow):
         self.show_in_folder_button.setVisible(False)
         self.progress_bar.setVisible(False)
         self.final_file_path = None
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
