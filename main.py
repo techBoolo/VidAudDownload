@@ -16,6 +16,7 @@ class Worker(QObject):
     error = Signal(str)
 
     def validate_url(self, url):
+        # (Identical to previous step)
         try:
             ydl_opts = {'extract_flat': True, 'force_generic_extractor': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -26,20 +27,19 @@ class Worker(QObject):
         except Exception as e:
             self.error.emit(f"An error occurred: {str(e)}")
 
-    # 1. Create the start_download method.
     def start_download(self, download_info):
-        """
-        Starts the download process using yt-dlp.
-        """
         def progress_hook(d):
             if d['status'] == 'downloading':
-                # Extract percentage and emit it.
-                # The percent string can sometimes be ' N/A', so handle that.
                 if '%' in d['_percent_str']:
                     percent = int(float(d['_percent_str'].strip().replace('%', '')))
                     self.progress.emit(percent)
+            # 1. When the download is finished, capture the filename and emit the 'finished' signal.
+            elif d['status'] == 'finished':
+                self.finished.emit({
+                    'status': 'finished',
+                    'filename': d.get('filename')
+                })
 
-        # Set up the options for yt-dlp
         ydl_opts = {
             'format': download_info['format_id'],
             'outtmpl': download_info['save_path'],
@@ -50,15 +50,16 @@ class Worker(QObject):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([download_info['url']])
         except Exception as e:
-            self.error.emit(f"Download failed: {str(e)}")
+            # 1. Emit a user-friendly error message on failure.
+            self.error.emit(f"Download Failed: {str(e)}")
 
 
 class VidAudDownload(QMainWindow):
     def __init__(self):
         super().__init__()
-
         self.setWindowTitle("VidAudDownload")
         self.resize(800, 600)
+        self.final_file_path = None # To store the path of the completed download
 
         # --- UI Setup (Identical to previous step) ---
         central_widget = QWidget()
@@ -79,7 +80,6 @@ class VidAudDownload(QMainWindow):
         self.save_as_input = QLineEdit()
         main_layout.addWidget(self.save_as_input)
         destination_layout = QHBoxLayout()
-        # For now, we'll hardcode the destination. This will be updated in a later step.
         self.destination_folder = os.path.expanduser("~/Downloads")
         self.destination_path_label = QLabel(f"Destination: {self.destination_folder}")
         self.browse_button = QPushButton("Browse...")
@@ -115,97 +115,109 @@ class VidAudDownload(QMainWindow):
         self.worker.moveToThread(self.thread)
         self.thread.start()
 
-        # 2. Connect new signals and slots
+        # 2. Connect the worker's 'finished' signal
         self.url_input.textChanged.connect(self.on_url_changed)
         self.video_radio.toggled.connect(self.on_url_changed)
-        self.download_button.clicked.connect(self.on_download_clicked) # New connection
+        self.download_button.clicked.connect(self.on_download_clicked)
         self.worker.info_ready.connect(self.on_info_ready)
-        self.worker.progress.connect(self.update_progress) # New connection
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.on_download_finished) # New connection
         self.worker.error.connect(self.on_error)
 
     def on_url_changed(self, url=""):
+        # (Identical to previous step)
         if not self.url_input.text():
             return
-        self.status_label.setText("Validating URL...")
-        self.quality_dropdown.setEnabled(False)
-        self.save_as_input.setEnabled(False)
-        self.download_button.setEnabled(False)
-        self.playlist_checkbox.setVisible(False)
+        self.reset_ui_for_new_url()
         QMetaObject.invokeMethod(self.worker, "validate_url", Qt.ConnectionType.QueuedConnection, Q_ARG(str, self.url_input.text()))
-
+    
     def on_info_ready(self, info):
         # (Identical to previous step)
         self.quality_dropdown.clear()
         first_video_info = info['entries'][0] if 'entries' in info else info
-        if 'entries' in info:
-            self.playlist_checkbox.setVisible(True)
-            self.save_as_input.setText(info.get('title', 'Playlist'))
-        else:
-            self.playlist_checkbox.setVisible(False)
-            self.save_as_input.setText(first_video_info.get('title', ''))
+        if 'entries' in info: self.playlist_checkbox.setVisible(True)
+        else: self.playlist_checkbox.setVisible(False)
+        self.save_as_input.setText(first_video_info.get('title', ''))
         formats = first_video_info.get('formats', [])
         for f in reversed(formats):
             if self.video_radio.isChecked():
                 if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
-                    resolution = f.get('resolution', 'N/A')
-                    fps = f.get('fps')
-                    filesize = f.get('filesize_approx')
-                    filesize_str = f"~{filesize / (1024*1024):.2f} MB" if filesize else "Size N/A"
-                    display_text = f"Video: {resolution} ({fps}fps) - {filesize_str}"
+                    display_text = f"Video: {f.get('resolution', 'N/A')} ({f.get('fps')}fps)"
                     self.quality_dropdown.addItem(display_text, f['format_id'])
             else:
                 if f.get('vcodec') == 'none' and f.get('acodec') != 'none':
-                    abr = f.get('abr')
-                    filesize = f.get('filesize_approx')
-                    filesize_str = f"~{filesize / (1024*1024):.2f} MB" if filesize else "Size N/A"
-                    display_text = f"Audio: {abr}kbps ({f['ext']}) - {filesize_str}"
+                    display_text = f"Audio: {f.get('abr')}kbps ({f['ext']})"
                     self.quality_dropdown.addItem(display_text, f['format_id'])
         if self.quality_dropdown.count() > 0:
             self.quality_dropdown.setCurrentIndex(0)
             self.quality_dropdown.setEnabled(True)
             self.download_button.setEnabled(True)
             self.status_label.setText("Ready to download")
-        else:
-            self.status_label.setText("No compatible formats found.")
+        else: self.status_label.setText("No compatible formats found.")
         self.save_as_input.setEnabled(True)
 
     def on_download_clicked(self):
-        """
-        Gathers info and triggers the download on the worker thread.
-        """
-        # Construct the save path. yt-dlp will add the correct extension.
-        # We sanitize the filename to avoid issues with special characters.
+        # (Identical to previous step)
         sanitized_filename = "".join([c for c in self.save_as_input.text() if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).rstrip()
-        save_path = os.path.join(self.destination_folder, sanitized_filename)
+        save_path = os.path.join(self.destination_folder, sanitized_filename + ".%(ext)s")
+        download_info = {'url': self.url_input.text(), 'format_id': self.quality_dropdown.currentData(), 'save_path': save_path}
+        self.prepare_ui_for_download()
+        QMetaObject.invokeMethod(self.worker, "start_download", Qt.ConnectionType.QueuedConnection, Q_ARG(dict, download_info))
 
-        # Package all the info the worker needs.
-        download_info = {
-            'url': self.url_input.text(),
-            'format_id': self.quality_dropdown.currentData(),
-            'save_path': save_path,
-        }
+    def update_progress(self, percent):
+        self.progress_bar.setValue(percent)
         
-        # Prepare UI for download
+    def on_download_finished(self, result_dict):
+        """
+        Handles the successful completion of a download.
+        """
+        self.progress_bar.setValue(100)
+        self.status_label.setText("Download Complete")
+        self.final_file_path = result_dict.get('filename')
+        self.show_in_folder_button.setVisible(True)
+        self.reset_ui_after_download()
+
+    def on_error(self, error_message):
+        """
+        Handles any error signal from the worker.
+        """
+        self.status_label.setText(error_message)
+        self.reset_ui_after_download()
+        
+    # --- UI State Management Methods ---
+    
+    def prepare_ui_for_download(self):
+        """Disables controls and shows progress bar before download."""
+        self.url_input.setEnabled(False)
+        self.quality_dropdown.setEnabled(False)
         self.download_button.setVisible(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.cancel_button.setVisible(True)
         self.status_label.setText("Downloading...")
-        self.url_input.setEnabled(False)
+
+    def reset_ui_after_download(self):
+        """Resets the UI to its 'ready' state after a download finishes or fails."""
+        self.url_input.setEnabled(True)
+        self.download_button.setVisible(True)
+        self.download_button.setEnabled(True)
+        self.quality_dropdown.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+    
+    def reset_ui_for_new_url(self):
+        """Resets UI elements when a new URL is entered."""
+        self.status_label.setText("Validating URL...")
+        self.quality_dropdown.clear()
         self.quality_dropdown.setEnabled(False)
-        
-        # Asynchronously call the worker's start_download method.
-        QMetaObject.invokeMethod(self.worker, "start_download", Qt.ConnectionType.QueuedConnection, Q_ARG(dict, download_info))
+        self.save_as_input.clear()
+        self.save_as_input.setEnabled(False)
+        self.download_button.setEnabled(False)
+        self.playlist_checkbox.setVisible(False)
+        self.show_in_folder_button.setVisible(False)
+        self.progress_bar.setVisible(False)
+        self.final_file_path = None
 
-    def update_progress(self, percent):
-        """
-        Sets the value of the progress bar.
-        """
-        self.progress_bar.setValue(percent)
-
-    def on_error(self, error_message):
-        self.status_label.setText(error_message)
-        # We will add full UI reset logic in the next step.
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
