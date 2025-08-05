@@ -1,4 +1,5 @@
 import sys
+import os
 import yt_dlp
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
@@ -16,8 +17,6 @@ class Worker(QObject):
 
     def validate_url(self, url):
         try:
-            # Use 'extract_flat' for playlists to get entries faster.
-            # 'force_generic_extractor' can also help avoid fetching too much data initially.
             ydl_opts = {'extract_flat': True, 'force_generic_extractor': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -26,6 +25,32 @@ class Worker(QObject):
             self.error.emit("Invalid or Unsupported URL")
         except Exception as e:
             self.error.emit(f"An error occurred: {str(e)}")
+
+    # 1. Create the start_download method.
+    def start_download(self, download_info):
+        """
+        Starts the download process using yt-dlp.
+        """
+        def progress_hook(d):
+            if d['status'] == 'downloading':
+                # Extract percentage and emit it.
+                # The percent string can sometimes be ' N/A', so handle that.
+                if '%' in d['_percent_str']:
+                    percent = int(float(d['_percent_str'].strip().replace('%', '')))
+                    self.progress.emit(percent)
+
+        # Set up the options for yt-dlp
+        ydl_opts = {
+            'format': download_info['format_id'],
+            'outtmpl': download_info['save_path'],
+            'progress_hooks': [progress_hook],
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([download_info['url']])
+        except Exception as e:
+            self.error.emit(f"Download failed: {str(e)}")
 
 
 class VidAudDownload(QMainWindow):
@@ -54,7 +79,9 @@ class VidAudDownload(QMainWindow):
         self.save_as_input = QLineEdit()
         main_layout.addWidget(self.save_as_input)
         destination_layout = QHBoxLayout()
-        self.destination_path_label = QLabel("Destination: [Not Selected]")
+        # For now, we'll hardcode the destination. This will be updated in a later step.
+        self.destination_folder = os.path.expanduser("~/Downloads")
+        self.destination_path_label = QLabel(f"Destination: {self.destination_folder}")
         self.browse_button = QPushButton("Browse...")
         destination_layout.addWidget(self.destination_path_label)
         destination_layout.addWidget(self.browse_button)
@@ -88,83 +115,97 @@ class VidAudDownload(QMainWindow):
         self.worker.moveToThread(self.thread)
         self.thread.start()
 
-        # Connect signals to slots
+        # 2. Connect new signals and slots
         self.url_input.textChanged.connect(self.on_url_changed)
-        # Re-fetch info if the user changes the media type
         self.video_radio.toggled.connect(self.on_url_changed)
+        self.download_button.clicked.connect(self.on_download_clicked) # New connection
         self.worker.info_ready.connect(self.on_info_ready)
+        self.worker.progress.connect(self.update_progress) # New connection
         self.worker.error.connect(self.on_error)
 
-    def on_url_changed(self, url=""): # Default arg to handle radio button signal
+    def on_url_changed(self, url=""):
         if not self.url_input.text():
             return
-            
         self.status_label.setText("Validating URL...")
         self.quality_dropdown.setEnabled(False)
         self.save_as_input.setEnabled(False)
         self.download_button.setEnabled(False)
         self.playlist_checkbox.setVisible(False)
-        
         QMetaObject.invokeMethod(self.worker, "validate_url", Qt.ConnectionType.QueuedConnection, Q_ARG(str, self.url_input.text()))
 
     def on_info_ready(self, info):
-        """
-        Slot to handle the `info_ready` signal. Populates the UI with fetched data.
-        """
-        # 1. Clear previous items
+        # (Identical to previous step)
         self.quality_dropdown.clear()
-        
-        # In case of playlist, info might be for the whole list. We need info for the first video.
         first_video_info = info['entries'][0] if 'entries' in info else info
-
-        # 2. Check for playlist and show checkbox
         if 'entries' in info:
             self.playlist_checkbox.setVisible(True)
             self.save_as_input.setText(info.get('title', 'Playlist'))
         else:
             self.playlist_checkbox.setVisible(False)
             self.save_as_input.setText(first_video_info.get('title', ''))
-
-        # 3. Parse formats and populate quality dropdown
         formats = first_video_info.get('formats', [])
-        for f in reversed(formats): # Start with best quality
-            # User wants Video
+        for f in reversed(formats):
             if self.video_radio.isChecked():
-                # We need formats that have both video and audio
                 if f.get('vcodec') != 'none' and f.get('acodec') != 'none':
                     resolution = f.get('resolution', 'N/A')
                     fps = f.get('fps')
                     filesize = f.get('filesize_approx')
                     filesize_str = f"~{filesize / (1024*1024):.2f} MB" if filesize else "Size N/A"
                     display_text = f"Video: {resolution} ({fps}fps) - {filesize_str}"
-                    # Store the format_id with the item
                     self.quality_dropdown.addItem(display_text, f['format_id'])
-            # User wants Audio only
             else:
-                # We need formats that have audio but no video
                 if f.get('vcodec') == 'none' and f.get('acodec') != 'none':
-                    abr = f.get('abr') # Average bitrate
+                    abr = f.get('abr')
                     filesize = f.get('filesize_approx')
                     filesize_str = f"~{filesize / (1024*1024):.2f} MB" if filesize else "Size N/A"
                     display_text = f"Audio: {abr}kbps ({f['ext']}) - {filesize_str}"
                     self.quality_dropdown.addItem(display_text, f['format_id'])
-        
-        # 4. Enable UI controls
         if self.quality_dropdown.count() > 0:
-            self.quality_dropdown.setCurrentIndex(0) # Select best quality by default
+            self.quality_dropdown.setCurrentIndex(0)
             self.quality_dropdown.setEnabled(True)
             self.download_button.setEnabled(True)
             self.status_label.setText("Ready to download")
         else:
             self.status_label.setText("No compatible formats found.")
-
         self.save_as_input.setEnabled(True)
 
+    def on_download_clicked(self):
+        """
+        Gathers info and triggers the download on the worker thread.
+        """
+        # Construct the save path. yt-dlp will add the correct extension.
+        # We sanitize the filename to avoid issues with special characters.
+        sanitized_filename = "".join([c for c in self.save_as_input.text() if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).rstrip()
+        save_path = os.path.join(self.destination_folder, sanitized_filename)
+
+        # Package all the info the worker needs.
+        download_info = {
+            'url': self.url_input.text(),
+            'format_id': self.quality_dropdown.currentData(),
+            'save_path': save_path,
+        }
+        
+        # Prepare UI for download
+        self.download_button.setVisible(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.cancel_button.setVisible(True)
+        self.status_label.setText("Downloading...")
+        self.url_input.setEnabled(False)
+        self.quality_dropdown.setEnabled(False)
+        
+        # Asynchronously call the worker's start_download method.
+        QMetaObject.invokeMethod(self.worker, "start_download", Qt.ConnectionType.QueuedConnection, Q_ARG(dict, download_info))
+
+    def update_progress(self, percent):
+        """
+        Sets the value of the progress bar.
+        """
+        self.progress_bar.setValue(percent)
 
     def on_error(self, error_message):
         self.status_label.setText(error_message)
-        self.quality_dropdown.clear()
-
+        # We will add full UI reset logic in the next step.
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
