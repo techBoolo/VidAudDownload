@@ -1,22 +1,37 @@
 import sys
+import yt_dlp
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout,
     QLineEdit, QRadioButton, QComboBox, QPushButton,
     QCheckBox, QProgressBar, QLabel
 )
-from PySide6.QtCore import Qt, QObject, Signal, QThread
+from PySide6.QtCore import Qt, QObject, Signal, QThread, QMetaObject
 
-# 1. Create a new class named `Worker` that inherits from `QObject`.
 class Worker(QObject):
-    """
-    Handles long-running tasks in a separate thread.
-    """
-    # 2. Define custom signals for communication.
     info_ready = Signal(dict)
     progress = Signal(int)
     finished = Signal(dict)
     error = Signal(str)
+
+    # 1. Create the validate_url method.
+    def validate_url(self, url):
+        """
+        Uses yt-dlp to validate the URL and extract info.
+        """
+        try:
+            # Use a yt-dlp context manager to extract info without downloading.
+            with yt_dlp.YoutubeDL({'noplaylist': True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                # If successful, emit the info dictionary.
+                self.info_ready.emit(info)
+        except yt_dlp.utils.DownloadError:
+            # If it fails, emit an error message.
+            self.error.emit("Invalid or Unsupported URL")
+        except Exception as e:
+            # Catch other potential errors.
+            self.error.emit(f"An error occurred: {str(e)}")
+
 
 class VidAudDownload(QMainWindow):
     def __init__(self):
@@ -86,11 +101,44 @@ class VidAudDownload(QMainWindow):
         self.download_button.setEnabled(False)
         # --- End of UI Setup ---
 
-        # 3. Create and start the worker thread.
         self.thread = QThread()
         self.worker = Worker()
         self.worker.moveToThread(self.thread)
         self.thread.start()
+
+        # 2. Connect signals to slots.
+        self.url_input.textChanged.connect(self.on_url_changed)
+        self.worker.info_ready.connect(self.on_info_ready)
+        self.worker.error.connect(self.on_error)
+
+    def on_url_changed(self, url):
+        """
+        When the URL text changes, trigger the validation on the worker thread.
+        """
+        # Reset UI elements for a new URL
+        self.status_label.setText("Validating URL...")
+        self.quality_dropdown.setEnabled(False)
+        self.save_as_input.setEnabled(False)
+        self.download_button.setEnabled(False)
+        self.playlist_checkbox.setVisible(False)
+        
+        # Asynchronously invoke the validate_url method on the worker's thread.
+        QMetaObject.invokeMethod(self.worker, "validate_url", Qt.ConnectionType.QueuedConnection, Q_ARG(str, url))
+
+    def on_info_ready(self, info):
+        """
+        Slot to handle the `info_ready` signal from the worker.
+        """
+        # This will be fully implemented in Step 5.
+        # For now, we'll just confirm it works.
+        self.status_label.setText(f"Successfully found: {info['title']}")
+        print("Info received:", info)
+
+    def on_error(self, error_message):
+        """
+        Slot to handle the `error` signal from the worker.
+        """
+        self.status_label.setText(error_message)
 
 
 if __name__ == "__main__":
