@@ -1,7 +1,7 @@
 import sys
 import os
-import re              # New import
-import subprocess      # New import
+import re
+import subprocess
 import configparser
 import yt_dlp
 from PySide6.QtWidgets import (
@@ -10,10 +10,10 @@ from PySide6.QtWidgets import (
     QLineEdit, QRadioButton, QComboBox, QPushButton,
     QCheckBox, QProgressBar, QLabel, QFileDialog
 )
-from PySide6.QtCore import Qt, QObject, Signal, QThread, QMetaObject, QEvent # New import
+from PySide6.QtCore import (Qt, QObject, Signal, QThread, QMetaObject,
+                            QEvent, Q_ARG, Slot)
 
 class Worker(QObject):
-    # --- Worker class is identical to Step 10. No changes here. ---
     info_ready = Signal(dict)
     progress = Signal(int)
     playlist_progress = Signal(str)
@@ -24,15 +24,18 @@ class Worker(QObject):
         super().__init__()
         self._is_cancelled = False
 
+    @Slot(str)
     def validate_url(self, url):
         try:
-            ydl_opts = {'extract_flat': True, 'force_generic_extractor': True}
+            # Add no_color here as well for consistency
+            ydl_opts = {'extract_flat': True, 'force_generic_extractor': True, 'no_color': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 self.info_ready.emit(info)
         except Exception as e:
             self.error.emit(f"Validation failed: {str(e)}")
 
+    @Slot(dict)
     def start_download(self, download_info):
         self._is_cancelled = False
         def progress_hook(d):
@@ -40,18 +43,34 @@ class Worker(QObject):
             if d['status'] == 'downloading':
                 if '%' in d['_percent_str']:
                     self.progress.emit(int(float(d['_percent_str'].strip().replace('%', ''))))
-            elif d['status'] == 'finished' and not download_info['is_playlist']:
-                self.finished.emit({'status': 'finished', 'filename': d.get('filename')})
+            elif d['status'] == 'finished':
+                if not download_info.get('is_playlist', False):
+                    self.finished.emit({'status': 'finished', 'filename': d.get('filename')})
+
         try:
             if not download_info['is_playlist']:
+                # --- FIX FOR SINGLE VIDEO ---
                 ydl_opts = {
-                    'format': download_info['format_id'], 'outtmpl': download_info['save_path'],
-                    'progress_hooks': [progress_hook]
+                    'format': download_info['format_id'],
+                    'outtmpl': download_info['save_path'],
+                    'progress_hooks': [progress_hook],
+                    'no_color': True  # Add the fix here
                 }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([download_info['url']])
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([download_info['url']])
+                except yt_dlp.utils.DownloadError:
+                    self.playlist_progress.emit("Chosen format failed. Trying best available...")
+                    fallback_opts = {
+                        'outtmpl': download_info['save_path'],
+                        'progress_hooks': [progress_hook],
+                        'no_color': True  # And also here for the fallback
+                    }
+                    with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                        ydl.download([download_info['url']])
             else:
-                with yt_dlp.YoutubeDL({'extract_flat': 'in_playlist'}) as ydl:
+                # --- FIX FOR PLAYLIST ---
+                with yt_dlp.YoutubeDL({'extract_flat': 'in_playlist', 'no_color': True}) as ydl:
                     playlist_info = ydl.extract_info(download_info['url'], download=False)
                 total_videos = len(playlist_info['entries'])
                 for i, entry in enumerate(playlist_info['entries']):
@@ -64,7 +83,8 @@ class Worker(QObject):
                     video_save_path = os.path.join(os.path.dirname(download_info['save_path']), sanitized_title + ".%(ext)s")
                     ydl_opts = {
                         'format': download_info['format_id'], 'outtmpl': video_save_path,
-                        'progress_hooks': [progress_hook], 'noplaylist': True
+                        'progress_hooks': [progress_hook], 'noplaylist': True,
+                        'no_color': True # And also here for each playlist item
                     }
                     try:
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -73,7 +93,7 @@ class Worker(QObject):
                         self.playlist_progress.emit(f"Format failed for '{entry.get('title')}'. Trying best available...")
                         fallback_opts = {
                             'outtmpl': video_save_path, 'progress_hooks': [progress_hook],
-                            'noplaylist': True
+                            'noplaylist': True, 'no_color': True # And finally here for the playlist fallback
                         }
                         with yt_dlp.YoutubeDL(fallback_opts) as ydl:
                             ydl.download([video_url])
@@ -84,23 +104,23 @@ class Worker(QObject):
             else:
                 self.error.emit(f"Download Failed: {str(e)}")
 
+    @Slot()
     def cancel_download(self):
         self._is_cancelled = True
 
 
 class VidAudDownload(QMainWindow):
+    download_requested = Signal(dict)
+    # --- The VidAudDownload class is identical to the previous step. No changes needed here. ---
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VidAudDownload")
         self.resize(800, 600)
         self.final_file_path = None
         self.settings_file = 'config.ini'
-
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-
-        # ... (All UI widget definitions are identical to Step 10) ...
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("Paste video or playlist URL here")
         main_layout.addWidget(self.url_input)
@@ -143,28 +163,23 @@ class VidAudDownload(QMainWindow):
         self.quality_dropdown.setEnabled(False)
         self.save_as_input.setEnabled(False)
         self.download_button.setEnabled(False)
-
         self.thread = QThread()
         self.worker = Worker()
         self.worker.moveToThread(self.thread)
         self.thread.start()
-
-        # Connect signals and slots
         self.url_input.textChanged.connect(self.on_url_changed)
         self.video_radio.toggled.connect(self.on_url_changed)
         self.download_button.clicked.connect(self.on_download_clicked)
         self.cancel_button.clicked.connect(self.on_cancel_clicked)
         self.browse_button.clicked.connect(self.open_folder_dialog)
-        self.show_in_folder_button.clicked.connect(self.open_download_folder) # New connection
+        self.show_in_folder_button.clicked.connect(self.open_download_folder)
+        self.download_requested.connect(self.worker.start_download)
         self.worker.info_ready.connect(self.on_info_ready)
         self.worker.progress.connect(self.update_progress)
         self.worker.playlist_progress.connect(self.update_playlist_progress)
         self.worker.finished.connect(self.on_download_finished)
         self.worker.error.connect(self.on_error)
-
         self.load_settings()
-
-    # 1. Implement Clipboard Auto-Paste
     def event(self, event):
         if event.type() == QEvent.Type.WindowActivate:
             clipboard_text = QApplication.clipboard().text()
@@ -172,32 +187,29 @@ class VidAudDownload(QMainWindow):
                 self.url_input.setText(clipboard_text)
                 self.url_input.selectAll()
         return super().event(event)
-
-    # 2. Wire up the "Show in Folder" button
+    def on_download_clicked(self):
+        is_playlist = self.playlist_checkbox.isVisible() and self.playlist_checkbox.isChecked()
+        sanitized_filename = "".join([c for c in self.save_as_input.text() if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).rstrip()
+        save_path = os.path.join(self.destination_folder, sanitized_filename + ".%(ext)s")
+        download_info = {'url': self.url_input.text(), 'format_id': self.quality_dropdown.currentData(), 'save_path': save_path, 'is_playlist': is_playlist}
+        self.prepare_ui_for_download()
+        self.download_requested.emit(download_info)
+    def on_cancel_clicked(self):
+        self.worker.cancel_download()
+        self.reset_ui_after_download()
+        self.status_label.setText("Download Cancelled")
     def open_download_folder(self):
-        """Opens the folder containing the last downloaded file."""
-        # Use the folder of the last completed single file
         path_to_open = self.final_file_path
-        
-        # If it was a playlist or the file path is gone, fall back to the main destination folder
         if not path_to_open or not os.path.exists(os.path.dirname(path_to_open)):
              path_to_open = self.destination_folder
-        
         folder_path = os.path.dirname(path_to_open) if os.path.isfile(path_to_open) else path_to_open
-
         try:
-            if sys.platform == 'win32':
-                os.startfile(folder_path)
-            elif sys.platform == 'darwin':
-                subprocess.run(['open', folder_path], check=True)
-            else: # Linux and other Unix-like
-                subprocess.run(['xdg-open', folder_path], check=True)
+            if sys.platform == 'win32': os.startfile(folder_path)
+            elif sys.platform == 'darwin': subprocess.run(['open', folder_path], check=True)
+            else: subprocess.run(['xdg-open', folder_path], check=True)
         except Exception as e:
             self.status_label.setText(f"Could not open folder: {e}")
-
-    # 3. Review UI State Management
     def reset_ui_for_new_url(self):
-        """Resets UI elements when a new URL is entered."""
         self.status_label.setText("Validating URL...")
         self.quality_dropdown.clear()
         self.quality_dropdown.setEnabled(False)
@@ -205,19 +217,15 @@ class VidAudDownload(QMainWindow):
         self.save_as_input.setEnabled(False)
         self.download_button.setEnabled(False)
         self.playlist_checkbox.setVisible(False)
-        self.show_in_folder_button.setVisible(False) # Hides button for a new URL
+        self.show_in_folder_button.setVisible(False)
         self.progress_bar.setVisible(False)
         self.final_file_path = None
-
     def on_download_finished(self, result_dict):
-        """Handles successful completion and makes the 'Show in Folder' button visible."""
         self.progress_bar.setValue(100)
         self.status_label.setText("Download Complete")
         self.final_file_path = result_dict.get('filename')
-        self.show_in_folder_button.setVisible(True) # Show the button on any successful completion
+        self.show_in_folder_button.setVisible(True)
         self.reset_ui_after_download()
-
-    # --- All other methods are identical to Step 10 ---
     def load_settings(self):
         config = configparser.ConfigParser()
         if os.path.exists(self.settings_file):
@@ -226,26 +234,22 @@ class VidAudDownload(QMainWindow):
         else:
             self.destination_folder = os.path.expanduser("~/Downloads")
         self.destination_path_label.setText(f"Destination: {self.destination_folder}")
-
     def save_settings(self):
         config = configparser.ConfigParser()
         config['Settings'] = {'destination_folder': self.destination_folder}
         with open(self.settings_file, 'w') as configfile:
             config.write(configfile)
-
     def open_folder_dialog(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Download Folder", self.destination_folder)
         if folder:
             self.destination_folder = folder
             self.destination_path_label.setText(f"Destination: {self.destination_folder}")
             self.save_settings()
-
     def on_url_changed(self, url=""):
         if not self.url_input.text() or not re.match(r'https?://\S+', self.url_input.text()):
             return
         self.reset_ui_for_new_url()
         QMetaObject.invokeMethod(self.worker, "validate_url", Qt.ConnectionType.QueuedConnection, Q_ARG(str, self.url_input.text()))
-
     def on_info_ready(self, info):
         self.quality_dropdown.clear()
         first_video_info = info['entries'][0] if 'entries' in info else info
@@ -271,34 +275,13 @@ class VidAudDownload(QMainWindow):
         else:
             self.status_label.setText("No compatible formats found.")
         self.save_as_input.setEnabled(True)
-
-    def on_download_clicked(self):
-        is_playlist = self.playlist_checkbox.isVisible() and self.playlist_checkbox.isChecked()
-        sanitized_filename = "".join([c for c in self.save_as_input.text() if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).rstrip()
-        save_path = os.path.join(self.destination_folder, sanitized_filename + ".%(ext)s")
-        download_info = {
-            'url': self.url_input.text(), 'format_id': self.quality_dropdown.currentData(),
-            'save_path': save_path, 'is_playlist': is_playlist
-        }
-        self.prepare_ui_for_download()
-        QMetaObject.invokeMethod(self.worker, "start_download", Qt.ConnectionType.QueuedConnection, Q_ARG(dict, download_info))
-
     def update_progress(self, percent):
         self.progress_bar.setValue(percent)
-
     def update_playlist_progress(self, status_string):
         self.status_label.setText(status_string)
-
-    def on_cancel_clicked(self):
-        self.status_label.setText("Cancelling...")
-        self.worker.cancel_download()
-        self.reset_ui_after_download()
-        self.status_label.setText("Download Cancelled")
-
     def on_error(self, error_message):
         self.status_label.setText(error_message)
         self.reset_ui_after_download()
-
     def prepare_ui_for_download(self):
         self.url_input.setEnabled(False)
         self.quality_dropdown.setEnabled(False)
@@ -307,7 +290,6 @@ class VidAudDownload(QMainWindow):
         self.progress_bar.setValue(0)
         self.cancel_button.setVisible(True)
         self.status_label.setText("Downloading...")
-
     def reset_ui_after_download(self):
         self.url_input.setEnabled(True)
         self.download_button.setVisible(True)
