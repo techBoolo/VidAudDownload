@@ -15,6 +15,11 @@ class Worker(QObject):
     finished = Signal(dict)
     error = Signal(str)
 
+    # 1. Add instance attribute for cancellation flag.
+    def __init__(self):
+        super().__init__()
+        self._is_cancelled = False
+
     def validate_url(self, url):
         # (Identical to previous step)
         try:
@@ -28,13 +33,22 @@ class Worker(QObject):
             self.error.emit(f"An error occurred: {str(e)}")
 
     def start_download(self, download_info):
+        # 4. Reset cancellation flag at the start of a new download.
+        self._is_cancelled = False
+
         def progress_hook(d):
+            # 3. Check for cancellation flag in the progress hook.
+            if self._is_cancelled:
+                raise Exception('Download Cancelled')
+                
             if d['status'] == 'downloading':
                 if '%' in d['_percent_str']:
                     percent = int(float(d['_percent_str'].strip().replace('%', '')))
                     self.progress.emit(percent)
-            # 1. When the download is finished, capture the filename and emit the 'finished' signal.
             elif d['status'] == 'finished':
+                # Check one last time before finishing, in case cancel was clicked during post-processing.
+                if self._is_cancelled:
+                    raise Exception('Download Cancelled')
                 self.finished.emit({
                     'status': 'finished',
                     'filename': d.get('filename')
@@ -50,8 +64,17 @@ class Worker(QObject):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([download_info['url']])
         except Exception as e:
-            # 1. Emit a user-friendly error message on failure.
-            self.error.emit(f"Download Failed: {str(e)}")
+            # 4. Handle the cancellation exception cleanly.
+            if str(e) == 'Download Cancelled':
+                # Don't emit an error, just stop silently. The UI will handle the state.
+                print("Download successfully cancelled by user.")
+            else:
+                self.error.emit(f"Download Failed: {str(e)}")
+    
+    # 2. Create a public method to set the cancellation flag.
+    def cancel_download(self):
+        """Sets the flag to signal cancellation."""
+        self._is_cancelled = True
 
 
 class VidAudDownload(QMainWindow):
@@ -59,7 +82,7 @@ class VidAudDownload(QMainWindow):
         super().__init__()
         self.setWindowTitle("VidAudDownload")
         self.resize(800, 600)
-        self.final_file_path = None # To store the path of the completed download
+        self.final_file_path = None
 
         # --- UI Setup (Identical to previous step) ---
         central_widget = QWidget()
@@ -115,24 +138,22 @@ class VidAudDownload(QMainWindow):
         self.worker.moveToThread(self.thread)
         self.thread.start()
 
-        # 2. Connect the worker's 'finished' signal
+        # 5. Connect the Cancel button's clicked signal.
         self.url_input.textChanged.connect(self.on_url_changed)
         self.video_radio.toggled.connect(self.on_url_changed)
         self.download_button.clicked.connect(self.on_download_clicked)
+        self.cancel_button.clicked.connect(self.on_cancel_clicked) # New connection
         self.worker.info_ready.connect(self.on_info_ready)
         self.worker.progress.connect(self.update_progress)
-        self.worker.finished.connect(self.on_download_finished) # New connection
+        self.worker.finished.connect(self.on_download_finished)
         self.worker.error.connect(self.on_error)
 
+    # ... (on_url_changed, on_info_ready, on_download_clicked, update_progress methods are identical to Step 7) ...
     def on_url_changed(self, url=""):
-        # (Identical to previous step)
-        if not self.url_input.text():
-            return
+        if not self.url_input.text(): return
         self.reset_ui_for_new_url()
         QMetaObject.invokeMethod(self.worker, "validate_url", Qt.ConnectionType.QueuedConnection, Q_ARG(str, self.url_input.text()))
-    
     def on_info_ready(self, info):
-        # (Identical to previous step)
         self.quality_dropdown.clear()
         first_video_info = info['entries'][0] if 'entries' in info else info
         if 'entries' in info: self.playlist_checkbox.setVisible(True)
@@ -155,22 +176,28 @@ class VidAudDownload(QMainWindow):
             self.status_label.setText("Ready to download")
         else: self.status_label.setText("No compatible formats found.")
         self.save_as_input.setEnabled(True)
-
     def on_download_clicked(self):
-        # (Identical to previous step)
         sanitized_filename = "".join([c for c in self.save_as_input.text() if c.isalpha() or c.isdigit() or c in (' ', '_', '-')]).rstrip()
         save_path = os.path.join(self.destination_folder, sanitized_filename + ".%(ext)s")
         download_info = {'url': self.url_input.text(), 'format_id': self.quality_dropdown.currentData(), 'save_path': save_path}
         self.prepare_ui_for_download()
         QMetaObject.invokeMethod(self.worker, "start_download", Qt.ConnectionType.QueuedConnection, Q_ARG(dict, download_info))
-
     def update_progress(self, percent):
         self.progress_bar.setValue(percent)
         
+    def on_cancel_clicked(self):
+        """
+        Calls the worker's cancel method and updates the UI.
+        """
+        self.status_label.setText("Cancelling...")
+        self.worker.cancel_download()
+        # The UI will be fully reset by the on_error or on_download_finished signal,
+        # or in this case, by the download stopping and no signal being sent.
+        # We can add a more immediate reset here.
+        self.reset_ui_after_download()
+        self.status_label.setText("Download Cancelled")
+
     def on_download_finished(self, result_dict):
-        """
-        Handles the successful completion of a download.
-        """
         self.progress_bar.setValue(100)
         self.status_label.setText("Download Complete")
         self.final_file_path = result_dict.get('filename')
@@ -178,16 +205,11 @@ class VidAudDownload(QMainWindow):
         self.reset_ui_after_download()
 
     def on_error(self, error_message):
-        """
-        Handles any error signal from the worker.
-        """
         self.status_label.setText(error_message)
         self.reset_ui_after_download()
         
-    # --- UI State Management Methods ---
-    
+    # ... (UI State Management Methods are identical to Step 7) ...
     def prepare_ui_for_download(self):
-        """Disables controls and shows progress bar before download."""
         self.url_input.setEnabled(False)
         self.quality_dropdown.setEnabled(False)
         self.download_button.setVisible(False)
@@ -195,18 +217,14 @@ class VidAudDownload(QMainWindow):
         self.progress_bar.setValue(0)
         self.cancel_button.setVisible(True)
         self.status_label.setText("Downloading...")
-
     def reset_ui_after_download(self):
-        """Resets the UI to its 'ready' state after a download finishes or fails."""
         self.url_input.setEnabled(True)
         self.download_button.setVisible(True)
         self.download_button.setEnabled(True)
         self.quality_dropdown.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.cancel_button.setVisible(False)
-    
     def reset_ui_for_new_url(self):
-        """Resets UI elements when a new URL is entered."""
         self.status_label.setText("Validating URL...")
         self.quality_dropdown.clear()
         self.quality_dropdown.setEnabled(False)
